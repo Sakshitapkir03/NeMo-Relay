@@ -14,6 +14,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use nemo_relay_codecs::anthropic::{AnthropicMessagesCodec, AnthropicMessagesStreamingCodec};
+use nemo_relay_codecs::gemini_generate_content::{
+    GeminiGenerateContentCodec, GeminiGenerateContentStreamingCodec,
+};
 use nemo_relay_codecs::openai_chat::{OpenAIChatCodec, OpenAIChatStreamingCodec};
 use nemo_relay_codecs::openai_responses::{OpenAIResponsesCodec, OpenAIResponsesStreamingCodec};
 use nemo_relay_model_pricing::{
@@ -3151,4 +3154,90 @@ async fn anthropic_stream_validation_reports_error_events_before_polling_the_sou
     assert!(stream.next().await.is_none());
     stream.close().await.unwrap();
     assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+}
+
+/// A Gemini stream that ends with an in-stream `error` chunk is recorded as an error.
+#[tokio::test]
+async fn gemini_sessions_record_in_stream_error_chunks_as_errors() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    reset_global();
+    let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+    let captured = events.clone();
+    register_subscriber(
+        "gemini_stream_error_status",
+        Arc::new(move |event| captured.lock().unwrap().push(event.clone())),
+    )
+    .unwrap();
+    let session = push_scope(
+        PushScopeParams::builder()
+            .name("gemini_stream_error")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+
+    for (call, failed) in [(0_u64, false), (1_u64, true)] {
+        let codec = GeminiGenerateContentStreamingCodec::new();
+        let mut chunks = vec![json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "Partial"}]}, "index": 0}],
+            "modelVersion": "gemini-test"
+        })];
+        if failed {
+            chunks.push(json!({"error": {
+                "code": 503,
+                "message": "The model is overloaded. Please try again later.",
+                "status": "UNAVAILABLE"
+            }}));
+        } else {
+            chunks.push(json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": " done"}]},
+                    "finishReason": "STOP", "index": 0}],
+                "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15},
+                "modelVersion": "gemini-test"
+            }));
+        }
+        let request = LlmRequest {
+            headers: serde_json::Map::new(),
+            content: json!({"contents": []}),
+        };
+        let handle = llm_call(
+            LlmCallParams::builder()
+                .name("gemini.generate_content")
+                .parent(&session)
+                .request(&request)
+                .attributes(LlmAttributes::STREAMING)
+                .build(),
+        )
+        .unwrap();
+        let mut wrapper = LlmStreamWrapper::new(
+            codec.validate_stream(make_stream(chunks.into_iter().map(Ok).collect())),
+            handle,
+            codec.collector(),
+            codec.finalizer(),
+            None,
+            Some(json!({"call_index": call})),
+            Some(Arc::new(GeminiGenerateContentCodec)),
+        );
+        while let Some(item) = wrapper.next().await {
+            let _ = item;
+        }
+    }
+    pop_scope(PopScopeParams::builder().handle_uuid(&session.uuid).build()).unwrap();
+
+    let captured = captured_snapshot(&events);
+    let mut ends: Vec<_> = captured
+        .iter()
+        .filter(|event| is_llm_end(event) && event.parent_uuid() == Some(session.uuid))
+        .collect();
+    assert_eq!(ends.len(), 2);
+    ends.sort_by_key(|event| event.metadata().unwrap()["call_index"].as_u64().unwrap());
+    for (call, end) in ends.iter().enumerate() {
+        let failed = call == 1;
+        assert_eq!(
+            end.metadata().unwrap()["otel.status_code"],
+            if failed { "ERROR" } else { "OK" },
+            "call {call}"
+        );
+    }
+    deregister_subscriber("gemini_stream_error_status").unwrap();
 }
